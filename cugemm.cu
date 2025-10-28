@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <cstdint>
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -20,6 +21,8 @@
 #define cudaCheck(err) (cudaErrorCheck(err, __FILE__, __LINE__))
 #define cublasCheck(err) (cublasErrorCheck(err, __FILE__, __LINE__))
 #define ROUND_UP_TO_NEAREST(M, N) (((M) + (N)-1) / (N))
+
+#define uint uint32_t
 
 enum Algo
 {
@@ -115,7 +118,7 @@ int main(int argc, char **argv)
 
     uint16_t m = SIZE, n = SIZE, k = SIZE;
 
-    // GEMM computes C = α*AB+β*C
+    // GEMM computes C = alpha*AB+beta*C
 
     // just do pure A*B (for simpler debugging)
     float alpha = 1.0, beta = 1.0, initC = 1.0;
@@ -179,7 +182,7 @@ int main(int argc, char **argv)
             std::cout << " Logging faulty output into " << errLogFile << "\n";
             std::ofstream fs;
             fs.open(errLogFile, std::ios::out | std::ios::trunc);
-            fs << "α=" << alpha << " β=" << beta << std::endl;
+            fs << "alpha=" << alpha << " beta=" << beta << std::endl;
             fs << "C matrix initialized to " << initC << std::endl << std::endl;
             fs << "A:" << std::endl;
             print_matrix(A, m, n, fs);
@@ -333,7 +336,7 @@ __global__ void runBasic(int M, int N, int K, float alpha, float *A, float *B, f
     if (x < M && y < N)
     {
         float tmp = 0.0;
-        // C = α*(AxB)+β*C
+        // C = alpha*(AxB)+beta*C
         for (int i = 0; i < K; ++i)
         {
             // tmp += __A__[x][i] * __B__[i][y]
@@ -346,9 +349,24 @@ __global__ void runBasic(int M, int N, int K, float alpha, float *A, float *B, f
 
 __global__ void runGmemCoalesced(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C)
 {
-    // HW1 TODO: copy runBasic() code here and update to avoid uncoalesced accesses to global memory.
-    // Note, you are also free to change the grid dimensions in the kernel launch below.
+    int blocks_per_row = (N + blockDim.x - 1) / blockDim.x;
 
+    int row = blockIdx.x / blocks_per_row;  // which row
+    int col_block = blockIdx.x % blocks_per_row;  // which block within the row
+    int col = col_block * blockDim.x + threadIdx.x;  // which column
+
+    if (row < M && col < N)
+    {
+        float tmp = 0.0;
+        // C = alpha*(AxB)+beta*C
+        for (int i = 0; i < K; ++i)
+        {
+            // tmp += __A__[x][i] * __B__[i][y]
+            tmp += A[(row * K) + i] * B[(i * N) + col];
+        }
+        // __C__[x][y]
+        C[(row * N) + col] = (alpha * tmp) + (beta * C[row * N + col]);
+    }
 }
 
 const uint F = 32;
@@ -396,16 +414,17 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
         break;
     case basic:
     {
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
-        dim3 blockDim(32, 32);
-        runBasic<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+        dim3 gridSize(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
+        dim3 blockSize(32, 32);
+        runBasic<<<gridSize, blockSize>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
     case gmem_coalesced:
     {
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
-        dim3 blockDim(32, 32);
-        runGmemCoalesced<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+        int blockSize = 128;
+        int blocksPerRow = (N + blockSize - 1) / blockSize;
+        int gridSize = M * blocksPerRow;
+        runGmemCoalesced<<<gridSize, blockSize>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
     case smem:
@@ -414,9 +433,9 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
         assert(0 == N % F);
         assert(0 == K % F);
         // TODO: update your grid here
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
-        dim3 blockDim(32, 32);
-        runSharedMem<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+        dim3 gridSize(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
+        dim3 blockSize(32, 32);
+        runSharedMem<<<gridSize, blockSize>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
     case smem_multioutput:
@@ -427,9 +446,9 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
         assert(0 == F % G);
         assert((F*F) / (G*G) >= F);
         // TODO: update your grid here
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
-        dim3 blockDim(32, 32);
-        runSharedMemMultiOutput<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+        dim3 gridSize(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
+        dim3 blockSize(32, 32);
+        runSharedMemMultiOutput<<<gridSize, blockSize>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
     default:
