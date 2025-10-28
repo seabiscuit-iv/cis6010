@@ -384,6 +384,46 @@ __global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *
     __shared__ float SA[F][F];
     __shared__ float SB[F][F];
 
+    int blockRow = blockIdx.y;
+    int blockCol = blockIdx.x;
+
+    int threadRow = threadIdx.y;
+    int threadCol = threadIdx.x;
+
+    int row = blockRow * F + threadRow;
+    int col = blockCol * F + threadCol;
+
+    float tmp = 0.0f;
+
+    for (int t = 0; t < (K + F - 1) / F; ++t)
+    {
+        if (row < M && t*F + threadCol < K) {
+            SA[threadRow][threadCol] = A[row*K + t*F + threadCol];
+        }
+        else {
+            SA[threadRow][threadCol] = 0.0f;
+        }
+
+        if (col < N && t*F + threadRow < K) {
+            SB[threadRow][threadCol] = B[(t*F + threadRow)*N + col];
+        }
+        else {
+            SB[threadRow][threadCol] = 0.0f;
+        }
+
+        __syncthreads();
+
+        for (int i = 0; i < F; ++i) {
+            tmp += SA[threadRow][i] * SB[i][threadCol];
+        }
+
+        __syncthreads();
+    }
+
+    // Write the final result to C
+    if (row < M && col < N) {
+        C[row*N + col] = alpha * tmp + beta * C[row*N + col];
+    }
 }
 
 const uint G = 4;
@@ -432,11 +472,9 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
         assert(0 == M % F);
         assert(0 == N % F);
         assert(0 == K % F);
-        // TODO: update your grid here
-        dim3 gridSize(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
-        dim3 blockSize(32, 32);
-        runSharedMem<<<gridSize, blockSize>>>(M, N, K, alpha, A, B, beta, C);
-        break;
+        dim3 blockSize(F, F);
+        dim3 gridSize( ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F) );
+        runSharedMem<<<gridSize, blockSize>>>(M, N, K, alpha, A, B, beta, C);        break;
     }
     case smem_multioutput:
     {
