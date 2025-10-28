@@ -442,6 +442,65 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float 
 
     float LC[G][G] = {0.0};
 
+    int blockRow = blockIdx.y;
+    int blockCol = blockIdx.x;
+
+    int threadRow = threadIdx.y; // 0..F/G
+    int threadCol = threadIdx.x; // 0..F/G
+
+    int row = blockRow * F + threadRow * G; // F is a multiple of G, so this is every G
+    int col = blockCol * F + threadCol * G;
+
+    for (int t = 0; t < (K + F - 1) / F; ++t)
+    {
+        for (int gX = 0; gX < G; gX++) {
+            for (int gY = 0; gY < G; gY++) {
+                int tempRow = row + gX;
+                int tempCol = col + gY;
+                int tempThreadRow = G * threadRow + gX;
+                int tempThreadCol = G * threadCol + gY;
+
+                if (tempRow < M && t*F + tempThreadCol < K) {
+                    SA[tempThreadRow][tempThreadCol] = A[tempRow*K + t*F + tempThreadCol];
+                }
+                else {
+                    SA[tempThreadRow][tempThreadCol] = 0.0f;
+                }
+
+                if (tempCol < N && t*F + tempThreadRow < K) {
+                    SB[tempThreadRow][tempThreadCol] = B[(t*F + tempThreadRow)*N + tempCol];
+                }
+                else {
+                    SB[tempThreadRow][tempThreadCol] = 0.0f;
+                }
+            }
+        }
+
+        __syncthreads();
+
+        for (int gX = 0; gX < G; gX++) {
+            for (int gY = 0; gY < G; gY++) {
+                for (int i = 0; i < F; ++i) {
+                    int tempThreadRow = G * threadRow + gX;
+                    int tempThreadCol = G * threadCol + gY;
+                    LC[gX][gY] += SA[tempThreadRow][i] * SB[i][tempThreadCol];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write the final result to C
+    for (int gX = 0; gX < G; gX++) {
+        for (int gY = 0; gY < G; gY++) {
+            int tempRow = row + gX;
+            int tempCol = col + gY;
+            if (tempRow < M && tempCol < N) {
+                C[tempRow*N + tempCol] = alpha * LC[gX][gY] + beta * C[tempRow*N + tempCol];
+            }
+        }
+    }
 }
 
 void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
@@ -483,10 +542,9 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
         assert(0 == K % F);
         assert(0 == F % G);
         assert((F*F) / (G*G) >= F);
-        // TODO: update your grid here
-        dim3 gridSize(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
-        dim3 blockSize(32, 32);
-        runSharedMemMultiOutput<<<gridSize, blockSize>>>(M, N, K, alpha, A, B, beta, C);
+        dim3 blockSize(F/G, F/G);
+        dim3 gridSize( ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F) );
+        runSharedMemMultiOutput<<<gridSize, blockSize>>>(M, N, K, alpha, A, B, beta, C);        break;
         break;
     }
     default:
