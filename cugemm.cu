@@ -20,9 +20,12 @@
 
 #define cudaCheck(err) (cudaErrorCheck(err, __FILE__, __LINE__))
 #define cublasCheck(err) (cublasErrorCheck(err, __FILE__, __LINE__))
-#define ROUND_UP_TO_NEAREST(M, N) (((M) + (N)-1) / (N))
+#define ROUND_UP_TO_NEAREST(M, N) (((M) + (N) - 1) / (N))
 
 #define uint uint32_t
+
+const uint F = 32;
+const uint G = 4;
 
 enum Algo
 {
@@ -31,7 +34,8 @@ enum Algo
     gmem_coalesced,
     smem,
     smem_multioutput,
-    numAlgos
+    cuda_streams,
+    numAlgos,
 };
 
 const char *algo2str(Algo a)
@@ -48,6 +52,8 @@ const char *algo2str(Algo a)
         return "sharedmem";
     case smem_multioutput:
         return "sharedmem_multioutput";
+    case cuda_streams:
+        return "cuda_streams";
     default:
         return "INVALID";
     }
@@ -68,6 +74,9 @@ const std::string errLogFile = "gemmValidationFailure.txt";
 std::default_random_engine generator(2);
 std::uniform_real_distribution<float> distribution(0, 1);
 
+void cuda_streams_algo(int M, int N, int K, float alpha,
+                       float *A, float *B, float beta, float *C, float *hA, float *hB, float *hC, int streams);
+
 int main(int argc, char **argv)
 {
     // command-line flags
@@ -76,7 +85,8 @@ int main(int argc, char **argv)
         ("reps", "repeat GEMM this many times", cxxopts::value<uint16_t>()->default_value("1"))                           //
         ("algo", "GEMM algorithm to use, a number in [0,4], 0 is cuBLAS", cxxopts::value<uint16_t>()->default_value("0")) //
         ("validate", "Validate output against cuBLAS", cxxopts::value<bool>()->default_value("true"))                     //
-        ("rngseed", "PRNG seed", cxxopts::value<uint>()->default_value("2"))                     //
+        ("rngseed", "PRNG seed", cxxopts::value<uint>()->default_value("2"))                                              //
+        ("streams", "Number of streams for the pipelined memcpy", cxxopts::value<uint>()->default_value("8"))                                              //
         ("h,help", "Print usage");
 
     auto clFlags = options.parse(argc, argv);
@@ -88,8 +98,8 @@ int main(int argc, char **argv)
     const uint16_t SIZE = clFlags["size"].as<uint16_t>();
     if (SIZE % 32 != 0)
     {
-        //std::cout << "--size must be a multiple of 32" << std::endl;
-        //exit(EXIT_FAILURE);
+        // std::cout << "--size must be a multiple of 32" << std::endl;
+        // exit(EXIT_FAILURE);
     }
     const uint16_t REPS = clFlags["reps"].as<uint16_t>();
     const Algo ALGO = static_cast<Algo>(clFlags["algo"].as<uint16_t>());
@@ -101,6 +111,7 @@ int main(int argc, char **argv)
 
     const bool VALIDATE = clFlags["validate"].as<bool>();
     const uint SEED = clFlags["rngseed"].as<uint>();
+    const uint STREAMS = clFlags["streams"].as<uint>();
     generator.seed(SEED);
     printf("Multiplying two %u x %u matrices with %u trials using %s algorithm\n", SIZE, SIZE, REPS, algo2str(ALGO));
 
@@ -140,17 +151,26 @@ int main(int argc, char **argv)
     // print_matrix(B, SIZE, SIZE, std::cout);
     // print_matrix(C, SIZE, SIZE, std::cout);
 
+    printf("dimensions(m=n=k) %u, alpha: %f, beta: %f\n", m, alpha, beta);
+
     cudaCheck(cudaMalloc((void **)&dA, sizeof(float) * SIZE * SIZE));
     cudaCheck(cudaMalloc((void **)&dB, sizeof(float) * SIZE * SIZE));
     cudaCheck(cudaMalloc((void **)&dC, sizeof(float) * SIZE * SIZE));
     cudaCheck(cudaMalloc((void **)&dC_ref, sizeof(float) * SIZE * SIZE));
 
-    cudaCheck(cudaMemcpy(dA, A, sizeof(float) * SIZE * SIZE, cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(dB, B, sizeof(float) * SIZE * SIZE, cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(dC, C, sizeof(float) * SIZE * SIZE, cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(dC_ref, C, sizeof(float) * SIZE * SIZE, cudaMemcpyHostToDevice));
 
-    printf("dimensions(m=n=k) %u, alpha: %f, beta: %f\n", m, alpha, beta);
+    if (ALGO != cuda_streams)
+    {
+        cudaCheck(cudaMemcpy(dA, A, sizeof(float) * SIZE * SIZE, cudaMemcpyHostToDevice));
+        cudaCheck(cudaMemcpy(dB, B, sizeof(float) * SIZE * SIZE, cudaMemcpyHostToDevice));
+        cudaCheck(cudaMemcpy(dC, C, sizeof(float) * SIZE * SIZE, cudaMemcpyHostToDevice));
+    }
+    else
+    {
+        // do a piplined memcpy of dA, dB, dC
+        cuda_streams_algo(m, n, k, alpha, dA, dB, beta, dC, A, B, C, int(STREAMS));
+    }
 
     // Verify the correctness of the calculation, and execute it once before the
     // kernel function timing to avoid cold start errors
@@ -183,7 +203,8 @@ int main(int argc, char **argv)
             std::ofstream fs;
             fs.open(errLogFile, std::ios::out | std::ios::trunc);
             fs << "alpha=" << alpha << " beta=" << beta << std::endl;
-            fs << "C matrix initialized to " << initC << std::endl << std::endl;
+            fs << "C matrix initialized to " << initC << std::endl
+               << std::endl;
             fs << "A:" << std::endl;
             print_matrix(A, m, n, fs);
             fs << "B:" << std::endl;
@@ -202,7 +223,12 @@ int main(int argc, char **argv)
     for (int j = 0; j < REPS; j++)
     {
         // We don't reset dC between runs to save time
-        runAlgo(ALGO, handle, m, n, k, alpha, dA, dB, beta, dC);
+        if ( ALGO == cuda_streams ) {
+            cuda_streams_algo(m, n, k, alpha, dA, dB, beta, dC, A, B, C, int(STREAMS));
+        }
+        else {
+            runAlgo(ALGO, handle, m, n, k, alpha, dA, dB, beta, dC);
+        }
         cudaCheck(cudaDeviceSynchronize());
     }
 
@@ -233,6 +259,48 @@ int main(int argc, char **argv)
     cublasCheck(cublasDestroy(handle));
 
     return 0;
+}
+
+__global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C);
+
+void cuda_streams_algo(int M, int N, int K, float alpha,
+                       float *A, float *B, float beta, float *C, float *hA, float *hB, float *hC, int num_streams)
+{
+    printf("CUDA Streams Algo: %dx%d, %dx%d\n", M, K, K, N);
+
+    // first copy all of B
+    cudaCheck(cudaMemcpy(B, hB, sizeof(float) * K * N, cudaMemcpyHostToDevice));
+
+    std::vector<cudaStream_t> streams(num_streams);
+    int rows_per_stream = M / num_streams;
+
+    int row_start = 0;
+    for (int pass = 0; pass < num_streams; pass++)
+    {
+        int this_rows = min(rows_per_stream, M - row_start);
+
+        float* offsetA = A + row_start * K;
+        float* offsetC = C + row_start * N;
+        float* offsetHA = hA + row_start * K;
+        float* offsetHC = hC + row_start * N;
+
+        cudaCheck(cudaStreamCreate(&streams[pass]));
+        cudaCheck(cudaMemcpyAsync(offsetA, offsetHA, sizeof(float) * this_rows * K, cudaMemcpyHostToDevice, streams[pass]));
+        cudaCheck(cudaMemcpyAsync(offsetC, offsetHC, sizeof(float) * this_rows * N, cudaMemcpyHostToDevice, streams[pass]));
+
+        //run the kernel
+        dim3 blockSize(F / G, F / G);
+        dim3 gridSize(ROUND_UP_TO_NEAREST(N, F), ROUND_UP_TO_NEAREST(this_rows, F));
+        runSharedMemMultiOutput<<<gridSize, blockSize, 0, streams[pass]>>>(this_rows, N, K, alpha, offsetA, B, beta, offsetC);
+
+        cudaCheck(cudaMemcpyAsync(offsetHC, offsetC, sizeof(float) * this_rows * N, cudaMemcpyDeviceToHost, streams[pass]));
+        row_start += this_rows;
+    }
+
+    for (int pass = 0; pass < num_streams; pass++) {
+        cudaCheck(cudaStreamSynchronize(streams[pass]));
+        cudaCheck(cudaStreamDestroy(streams[pass]));
+    }
 }
 
 /** Function to check for errors in CUDA API calls */
@@ -293,7 +361,8 @@ void print_matrix(const float *A, int M, int N, std::ostream &outs)
                 outs << ";" << std::endl;
         }
     }
-    outs << "]" << std::endl << std::endl;
+    outs << "]" << std::endl
+         << std::endl;
 }
 
 bool verify_matrix(float *expected, float *actual, int M, int N)
@@ -351,9 +420,9 @@ __global__ void runGmemCoalesced(int M, int N, int K, float alpha, float *A, flo
 {
     int blocks_per_row = (N + blockDim.x - 1) / blockDim.x;
 
-    int row = blockIdx.x / blocks_per_row;  // which row
-    int col_block = blockIdx.x % blocks_per_row;  // which block within the row
-    int col = col_block * blockDim.x + threadIdx.x;  // which column
+    int row = blockIdx.x / blocks_per_row;          // which row
+    int col_block = blockIdx.x % blocks_per_row;    // which block within the row
+    int col = col_block * blockDim.x + threadIdx.x; // which column
 
     if (row < M && col < N)
     {
@@ -369,16 +438,14 @@ __global__ void runGmemCoalesced(int M, int N, int K, float alpha, float *A, flo
     }
 }
 
-const uint F = 32;
-
 __global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C)
 {
-    // HW2 TODO: Use shared memory to cache square FxF tiles of the A and B matrices in shared memory 
-    // (SA and SB, respectively, provided below). Each thread should compute the result for one cell 
+    // HW2 TODO: Use shared memory to cache square FxF tiles of the A and B matrices in shared memory
+    // (SA and SB, respectively, provided below). Each thread should compute the result for one cell
     // of the output matrix C.
 
     // Note, you will also need to change the grid dimensions in the kernel launch below to take into account the value
-    // of F (which is a constant, defined above). You should experiment with different values of F to see how it 
+    // of F (which is a constant, defined above). You should experiment with different values of F to see how it
     // affects performance.
 
     __shared__ float SA[F][F];
@@ -397,23 +464,28 @@ __global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *
 
     for (int t = 0; t < (K + F - 1) / F; ++t)
     {
-        if (row < M && t*F + threadCol < K) {
-            SA[threadRow][threadCol] = A[row*K + t*F + threadCol];
+        if (row < M && t * F + threadCol < K)
+        {
+            SA[threadRow][threadCol] = A[row * K + t * F + threadCol];
         }
-        else {
+        else
+        {
             SA[threadRow][threadCol] = 0.0f;
         }
 
-        if (col < N && t*F + threadRow < K) {
-            SB[threadRow][threadCol] = B[(t*F + threadRow)*N + col];
+        if (col < N && t * F + threadRow < K)
+        {
+            SB[threadRow][threadCol] = B[(t * F + threadRow) * N + col];
         }
-        else {
+        else
+        {
             SB[threadRow][threadCol] = 0.0f;
         }
 
         __syncthreads();
 
-        for (int i = 0; i < F; ++i) {
+        for (int i = 0; i < F; ++i)
+        {
             tmp += SA[threadRow][i] * SB[i][threadCol];
         }
 
@@ -421,20 +493,19 @@ __global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *
     }
 
     // Write the final result to C
-    if (row < M && col < N) {
-        C[row*N + col] = alpha * tmp + beta * C[row*N + col];
+    if (row < M && col < N)
+    {
+        C[row * N + col] = alpha * tmp + beta * C[row * N + col];
     }
 }
 
-const uint G = 4;
-
 __global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C)
 {
-    // HW3 TODO: Copy your runSharedMem() code here and update it so that each thread computes the result for GxG cells 
+    // HW3 TODO: Copy your runSharedMem() code here and update it so that each thread computes the result for GxG cells
     // of the output matrix C. Each thread should accumulate temporary results in the local LC matrix, provided below,
     // before writing them to C in global memory.
 
-    // Note, you will also need to change the grid dimensions in the kernel launch below. You should experiment 
+    // Note, you will also need to change the grid dimensions in the kernel launch below. You should experiment
     // with different values of F and G to see how they affect performance.
 
     __shared__ float SA[F][F];
@@ -453,24 +524,30 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float 
 
     for (int t = 0; t < (K + F - 1) / F; ++t)
     {
-        for (int gX = 0; gX < G; gX++) {
-            for (int gY = 0; gY < G; gY++) {
+        for (int gX = 0; gX < G; gX++)
+        {
+            for (int gY = 0; gY < G; gY++)
+            {
                 int tempRow = row + gX;
                 int tempCol = col + gY;
                 int tempThreadRow = G * threadRow + gX;
                 int tempThreadCol = G * threadCol + gY;
 
-                if (tempRow < M && t*F + tempThreadCol < K) {
-                    SA[tempThreadRow][tempThreadCol] = A[tempRow*K + t*F + tempThreadCol];
+                if (tempRow < M && t * F + tempThreadCol < K)
+                {
+                    SA[tempThreadRow][tempThreadCol] = A[tempRow * K + t * F + tempThreadCol];
                 }
-                else {
+                else
+                {
                     SA[tempThreadRow][tempThreadCol] = 0.0f;
                 }
 
-                if (tempCol < N && t*F + tempThreadRow < K) {
-                    SB[tempThreadRow][tempThreadCol] = B[(t*F + tempThreadRow)*N + tempCol];
+                if (tempCol < N && t * F + tempThreadRow < K)
+                {
+                    SB[tempThreadRow][tempThreadCol] = B[(t * F + tempThreadRow) * N + tempCol];
                 }
-                else {
+                else
+                {
                     SB[tempThreadRow][tempThreadCol] = 0.0f;
                 }
             }
@@ -478,9 +555,12 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float 
 
         __syncthreads();
 
-        for (int gX = 0; gX < G; gX++) {
-            for (int gY = 0; gY < G; gY++) {
-                for (int i = 0; i < F; ++i) {
+        for (int gX = 0; gX < G; gX++)
+        {
+            for (int gY = 0; gY < G; gY++)
+            {
+                for (int i = 0; i < F; ++i)
+                {
                     int tempThreadRow = G * threadRow + gX;
                     int tempThreadCol = G * threadCol + gY;
                     LC[gX][gY] += SA[tempThreadRow][i] * SB[i][tempThreadCol];
@@ -492,12 +572,15 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float 
     }
 
     // Write the final result to C
-    for (int gX = 0; gX < G; gX++) {
-        for (int gY = 0; gY < G; gY++) {
+    for (int gX = 0; gX < G; gX++)
+    {
+        for (int gY = 0; gY < G; gY++)
+        {
             int tempRow = row + gX;
             int tempCol = col + gY;
-            if (tempRow < M && tempCol < N) {
-                C[tempRow*N + tempCol] = alpha * LC[gX][gY] + beta * C[tempRow*N + tempCol];
+            if (tempRow < M && tempCol < N)
+            {
+                C[tempRow * N + tempCol] = alpha * LC[gX][gY] + beta * C[tempRow * N + tempCol];
             }
         }
     }
@@ -532,8 +615,9 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
         assert(0 == N % F);
         assert(0 == K % F);
         dim3 blockSize(F, F);
-        dim3 gridSize( ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F) );
-        runSharedMem<<<gridSize, blockSize>>>(M, N, K, alpha, A, B, beta, C);        break;
+        dim3 gridSize(ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F));
+        runSharedMem<<<gridSize, blockSize>>>(M, N, K, alpha, A, B, beta, C);
+        break;
     }
     case smem_multioutput:
     {
@@ -541,10 +625,15 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
         assert(0 == N % F);
         assert(0 == K % F);
         assert(0 == F % G);
-        assert((F*F) / (G*G) >= F);
-        dim3 blockSize(F/G, F/G);
-        dim3 gridSize( ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F) );
-        runSharedMemMultiOutput<<<gridSize, blockSize>>>(M, N, K, alpha, A, B, beta, C);        break;
+        assert((F * F) / (G * G) >= F);
+        dim3 blockSize(F / G, F / G);
+        dim3 gridSize(ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F));
+        runSharedMemMultiOutput<<<gridSize, blockSize>>>(M, N, K, alpha, A, B, beta, C);
+        break;
+        break;
+    }
+    case cuda_streams:
+    {
         break;
     }
     default:
